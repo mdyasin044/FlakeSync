@@ -3,6 +3,7 @@ package flakesync;
 import flakesync.common.ConfigurationDefaults;
 import flakesync.common.Level;
 import flakesync.common.Logger;
+import flakesync.heuristic.CandidateScorer;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.plugin.PluginExecutionException;
@@ -22,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
 
@@ -29,6 +31,15 @@ import java.util.Scanner;
 @Mojo(name = "barrierpointsearch", defaultPhase = LifecyclePhase.TEST,
         requiresDependencyResolution = ResolutionScope.TEST)
 public class BarrierPointMojo extends FlakeSyncAbstractMojo {
+
+    // When -Dflakesync.exhaustive=true, do not stop at the first working barrier point; keep evaluating every
+    // candidate so that any heuristic ordering can be replayed offline. Results file is unchanged either way
+    // (only the first success per line/frame is written, as in the original).
+    private static final boolean EXHAUSTIVE = Boolean.getBoolean("flakesync.exhaustive");
+
+    private void logCandidate(String phase, String group, int order, String candidate, String result, int runs) {
+        SearchLogger.log(this.baseDir.getAbsolutePath(), testName, phase, group, order, candidate, result, runs);
+    }
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
@@ -46,6 +57,11 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
             bw.newLine();
             bw.flush();
 
+            // [Heuristics] scores barrier candidates so the likeliest ones are tried first (-Dflakesync.heuristics=false
+            // keeps the original order)
+            CandidateScorer scorer = CandidateScorer.forProject(this.mavenProject.getBasedir());
+            Logger.getGlobal().log(Level.INFO, scorer.describe());
+
             FileReader boundaryResults = new FileReader(String.valueOf(Constants.getCritPointsResultsFilepath(
                     String.valueOf(this.mavenProject.getBasedir()), testName)));
             BufferedReader br = new BufferedReader(boundaryResults);
@@ -56,6 +72,9 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                 String endLoc = line.split("-")[1].split("\\[")[0];
                 int delay = Integer.parseInt(line.split("\\[")[1].substring(0,
                         line.split("\\[")[1].length() - 1));
+
+                // [SearchLogger] number of barrier candidates examined so far for this critical point
+                int candIdx = 0;
 
                 if (firstLoc.contains("Test")) { //Boundary exists in the test code
                     SurefireExecution execution = SurefireExecution.SurefireFactory.createDownwardMvnExec(
@@ -71,11 +90,23 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                             String.valueOf(this.mavenProject.getBasedir()), testName)));
                     BufferedReader reader = new BufferedReader(new FileReader(endLineFile));
 
+                    boolean foundHere = false;
                     String yieldPoint = reader.readLine().split("=")[1];
-                    for (int ln = Integer.parseInt(endLoc.split("#")[1]);
-                         ln < Integer.parseInt(yieldPoint.split("#")[1]); ln++) {
+                    // [Heuristics] lines below the critical point, ordered by score (original order if scoring is off)
+                    List<Integer> testLines = new ArrayList<Integer>();
+                    for (int l = Integer.parseInt(endLoc.split("#")[1]);
+                         l < Integer.parseInt(yieldPoint.split("#")[1]); l++) {
+                        testLines.add(l);
+                    }
+                    CandidateScorer.Plan testPlan = scorer.planBarrierLines(yieldPoint.split("#")[0], testLines, endLoc);
+                    int testBase = candIdx;
+                    for (int k = 0; k < testPlan.size(); k++) {
+                        int ln = testPlan.line(k);
                         String yieldingPoint = yieldPoint.split("#")[0] + "#" + ln;
                         System.out.println("TRYING TO YIELD AT: " + yieldingPoint);
+                        // [SearchLogger] "order" stays the position in FlakeSync's original order
+                        int order = testPlan.reordered() ? testBase + testPlan.originalPosition(k) : ++candIdx;
+                        int runs = 1;               // [SearchLogger] Surefire executions spent on this candidate
 
                         // Execute test with the delay and the new potential yield point
                         // (no need to output starting line anymore)
@@ -89,8 +120,15 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
 
                         // If the test now passes, and it was valid, add this point as the barrier point
                         if (!fail && checkValidPass()) {
-                            addBarrierPointToResults(bw, line, yieldingPoint, 1);
-                            break;
+                            logCandidate("barrier-test", endLoc, order, yieldingPoint, "FOUND", runs);
+                            if (!foundHere) {
+                                addBarrierPointToResults(bw, line, yieldingPoint, 1);
+                                foundHere = true;
+                            }
+                            if (!EXHAUSTIVE) {
+                                break;
+                            }
+                            continue;
                         } else {
                             // If test still fails, maybe critical point needs to execute more often
                             // Count how often it was executed
@@ -101,6 +139,7 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                                             ConfigurationDefaults.DEFAULT_FLAKESYNC_DIR).toString(),
                                     this.localRepository, this.testName, delay, endLoc);
                             executeSurefireExecution(null, execMon);
+                            runs++;
 
                             // Parse threshold file for new threshold and store in numExecutions
                             File execsFile = new File(String.valueOf(Constants.getThresholdFilepath(
@@ -116,13 +155,25 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                                     this.localRepository, this.testName, delay, endLoc.replace("/", "."),
                                     yieldingPoint, 1);
                             fail = executeSurefireExecution(null, execution);
+                            runs++;
 
                             if (!fail && checkValidPass()) {
                                 // If test passed, barrier point worked, and add to results file
-                                addBarrierPointToResults(bw, line, yieldingPoint, numExecutions);
-                                break;
+                                logCandidate("barrier-test", endLoc, order, yieldingPoint, "FOUND", runs);
+                                if (!foundHere) {
+                                    addBarrierPointToResults(bw, line, yieldingPoint, numExecutions);
+                                    foundHere = true;
+                                }
+                                if (!EXHAUSTIVE) {
+                                    break;
+                                }
+                                continue;
                             }
                         }
+                        logCandidate("barrier-test", endLoc, order, yieldingPoint, "NOT_FOUND", runs);
+                    }
+                    if (testPlan.reordered()) {
+                        candIdx = testBase + testPlan.size();   // [SearchLogger]
                     }
                 } else {
                     SurefireExecution stackTraceExec = SurefireExecution.SurefireFactory.createBarrierSTExec(this.surefire,
@@ -178,10 +229,23 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                             String beginLine = reader.readLine();
                             int beginning = Integer.parseInt(beginLine.split("#")[1]); // Parse from file
 
+                            boolean foundInFrame = false;
                             // Iterate upwards towards the start of the method, line-by-line
-                            for (int ln = Integer.parseInt(yieldPoint.split("#")[1]); ln >= beginning; ln--) {
+                            // [Heuristics] the lines of this frame, ordered by score (original order if scoring is off)
+                            List<Integer> frameLines = new ArrayList<Integer>();
+                            for (int fl = Integer.parseInt(yieldPoint.split("#")[1]); fl >= beginning; fl--) {
+                                frameLines.add(fl);
+                            }
+                            CandidateScorer.Plan framePlan = scorer.planBarrierLines(classN, frameLines, endLoc);
+                            int frameBase = candIdx;
+                            for (int k = 0; k < framePlan.size(); k++) {
+                                int ln = framePlan.line(k);
                                 String yieldingPoint = classN + "#" + ln;
                                 System.out.println("TRYING TO YIELD AT: " + yieldingPoint);
+                                // [SearchLogger] continues counting across stack frames, in the original order
+                                int order = framePlan.reordered() ? frameBase + framePlan.originalPosition(k)
+                                        : ++candIdx;
+                                int runs = 1;               // [SearchLogger]
 
                                 // Execute test with the delay and the new potential yield point
                                 // (no need to output starting line anymore)
@@ -194,8 +258,15 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
 
                                 // If the test now passes and it was valid, add this point as the barrier point
                                 if (!fail && checkValidPass()) {
-                                    addBarrierPointToResults(bw, line, yieldingPoint, 1);
-                                    break;
+                                    logCandidate("barrier-frame", endLoc, order, yieldingPoint, "FOUND", runs);
+                                    if (!foundInFrame) {
+                                        addBarrierPointToResults(bw, line, yieldingPoint, 1);
+                                        foundInFrame = true;
+                                    }
+                                    if (!EXHAUSTIVE) {
+                                        break;
+                                    }
+                                    continue;
                                 } else {
                                     // If test still fails, maybe critical point needs to execute more often
                                     // Count how often it was executed
@@ -206,6 +277,7 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                                             ConfigurationDefaults.DEFAULT_FLAKESYNC_DIR).toString(),
                                             this.localRepository, this.testName, delay, endLoc);
                                     executeSurefireExecution(null, execMon);
+                                    runs++;
 
                                     // Parse threshold file for new threshold and store in numExecutions
                                     File execsFile = new File(String.valueOf(Constants.getThresholdFilepath(
@@ -221,13 +293,25 @@ public class BarrierPointMojo extends FlakeSyncAbstractMojo {
                                             this.localRepository, this.testName, delay, endLoc, yieldingPoint,
                                             numExecutions);
                                     fail = executeSurefireExecution(null, barrierPoint);
+                                    runs++;
 
                                     if (!fail && checkValidPass()) {
                                         // If test passed, barrier point worked, and add to results file
-                                        addBarrierPointToResults(bw, line, yieldingPoint, numExecutions);
-                                        break;
+                                        logCandidate("barrier-frame", endLoc, order, yieldingPoint, "FOUND", runs);
+                                        if (!foundInFrame) {
+                                            addBarrierPointToResults(bw, line, yieldingPoint, numExecutions);
+                                            foundInFrame = true;
+                                        }
+                                        if (!EXHAUSTIVE) {
+                                            break;
+                                        }
+                                        continue;
                                     }
                                 }
+                                logCandidate("barrier-frame", endLoc, order, yieldingPoint, "NOT_FOUND", runs);
+                            }
+                            if (framePlan.reordered()) {
+                                candIdx = frameBase + framePlan.size();     // [SearchLogger]
                             }
                         }
                     }
